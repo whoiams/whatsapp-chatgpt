@@ -1,84 +1,100 @@
-const process = require("process")
-const qrcode = require("qrcode-terminal");
-const { Client } = require("whatsapp-web.js");
-import { ChatGPTAPIBrowser } from 'chatgpt'
+import qrcode from "qrcode-terminal";
+import { Client, Message, Events, LocalAuth } from "whatsapp-web.js";
 
-// Environment variables
-require("dotenv").config()
+// Constants
+import constants from "./constants";
 
-// Prefix check
-const prefixEnabled = process.env.PREFIX_ENABLED == "true"
-const prefix = '!gpt'
+// CLI
+import * as cli from "./cli/ui";
+import { handleIncomingMessage } from "./handlers/message";
 
-// Whatsapp Client
-const client = new Client()
+// Config
+import { initAiConfig } from "./handlers/ai-config";
+import { initOpenAI } from "./providers/openai";
 
-// ChatGPT Client
-const api = new ChatGPTAPIBrowser({
-    email: process.env.EMAIL,
-    password: process.env.PASSWORD
-})
+// Ready timestamp of the bot
+let botReadyTimestamp: Date | null = null;
 
 // Entrypoint
 const start = async () => {
-    // Ensure the API is properly authenticated
-    try {
-        await api.initSession()
-    } catch (error: any) {
-        console.error("[Whatsapp ChatGPT] Failed to authenticate with the ChatGPT API: " + error.message)
-        process.exit(1)
-    }
+	cli.printIntro();
 
-    // Whatsapp auth
-    client.on("qr", (qr: string) => {
-        console.log("[Whatsapp ChatGPT] Scan this QR code in whatsapp to log in:")
-        qrcode.generate(qr, { small: true });
-    })
+	// WhatsApp Client
+	const client = new Client({
+		puppeteer: {
+			args: ["--no-sandbox"]
+		},
+		authStrategy: new LocalAuth({
+			clientId: undefined,
+			dataPath: constants.sessionPath
+		})
+	});
 
-    // Whatsapp ready
-    client.on("ready", () => {
-        console.log("[Whatsapp ChatGPT] Client is ready!");
-    })
+	// WhatsApp auth
+	client.on(Events.QR_RECEIVED, (qr: string) => {
+		qrcode.generate(qr, { small: true }, (qrcode: string) => {
+			cli.printQRCode(qrcode);
+		});
+	});
 
-    // Whatsapp message
-    client.on("message", async (message: any) => {
-        if (message.body.length == 0) return
-        if (message.from == "status@broadcast") return
+	// WhatsApp loading
+	client.on(Events.LOADING_SCREEN, (percent) => {
+		if (percent == "0") {
+			cli.printLoading();
+		}
+	});
 
-        if (prefixEnabled) {
-            if (message.body.startsWith(prefix)) {
-                // Get the rest of the message
-                const prompt = message.body.substring(prefix.length + 1);
-                await handleMessage(message, prompt)
-            }
-        } else {
-            await handleMessage(message, message.body)
-        }
-    })
+	// WhatsApp authenticated
+	client.on(Events.AUTHENTICATED, () => {
+		cli.printAuthenticated();
+	});
 
-    client.initialize()
-}
+	// WhatsApp authentication failure
+	client.on(Events.AUTHENTICATION_FAILURE, () => {
+		cli.printAuthenticationFailure();
+	});
 
-const handleMessage = async (message: any, prompt: any) => {
-    try {
-        const start = Date.now()
+	// WhatsApp ready
+	client.on(Events.READY, () => {
+		// Print outro
+		cli.printOutro();
 
-        // Send the prompt to the API
-        console.log("[Whatsapp ChatGPT] Received prompt from " + message.from + ": " + prompt)
-        const response = await api.sendMessage(prompt)
+		// Set bot ready timestamp
+		botReadyTimestamp = new Date();
 
-        console.log(`[Whatsapp ChatGPT] Answer to ${message.from}: ${response.response}`)
+		initAiConfig();
+		initOpenAI();
+	});
 
-        const end = Date.now() - start
+	// WhatsApp message
+	client.on(Events.MESSAGE_RECEIVED, async (message: any) => {
+		// Ignore if message is from status broadcast
+		if (message.from == constants.statusBroadcast) return;
 
-        console.log("[Whatsapp ChatGPT] ChatGPT took " + end + "ms")
+		// Ignore if it's a quoted message, (e.g. Bot reply)
+		if (message.hasQuotedMsg) return;
 
-        // Send the response to the chat
-        message.reply(response.response)
-    } catch (error: any) {
-        console.error("An error occured", error)
-        message.reply("An error occured, please contact the administrator. (" + error.message + ")")
-    }
-}
+		await handleIncomingMessage(message);
+	});
 
-start()
+	// Reply to own message
+	client.on(Events.MESSAGE_CREATE, async (message: Message) => {
+		// Ignore if message is from status broadcast
+		if (message.from == constants.statusBroadcast) return;
+
+		// Ignore if it's a quoted message, (e.g. Bot reply)
+		if (message.hasQuotedMsg) return;
+
+		// Ignore if it's not from me
+		if (!message.fromMe) return;
+
+		await handleIncomingMessage(message);
+	});
+
+	// WhatsApp initialization
+	client.initialize();
+};
+
+start();
+
+export { botReadyTimestamp };
